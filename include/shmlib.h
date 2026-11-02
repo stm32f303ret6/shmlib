@@ -34,6 +34,7 @@ extern "C" {
 #define SHMLIB_MO_ACQUIRE __ATOMIC_ACQUIRE
 #define SHMLIB_MO_RELEASE __ATOMIC_RELEASE
 #define SHMLIB_MO_ACQ_REL __ATOMIC_ACQ_REL
+#define SHMLIB_MO_SEQ_CST __ATOMIC_SEQ_CST
 #define SHMLIB_ATOMIC_LOAD_U64(ptr, mo) __atomic_load_n((ptr), (mo))
 #define SHMLIB_ATOMIC_LOAD_U32(ptr, mo) __atomic_load_n((ptr), (mo))
 #define SHMLIB_ATOMIC_STORE_U64(ptr, val, mo) __atomic_store_n((ptr), (val), (mo))
@@ -50,6 +51,7 @@ extern "C" {
 #define SHMLIB_MO_ACQUIRE memory_order_acquire
 #define SHMLIB_MO_RELEASE memory_order_release
 #define SHMLIB_MO_ACQ_REL memory_order_acq_rel
+#define SHMLIB_MO_SEQ_CST memory_order_seq_cst
 #define SHMLIB_ATOMIC_LOAD_U64(ptr, mo) atomic_load_explicit((ptr), (mo))
 #define SHMLIB_ATOMIC_LOAD_U32(ptr, mo) atomic_load_explicit((ptr), (mo))
 #define SHMLIB_ATOMIC_STORE_U64(ptr, val, mo) atomic_store_explicit((ptr), (val), (mo))
@@ -109,9 +111,7 @@ typedef struct {
 
 // Get system page size
 static inline size_t shmlib__get_page_size(void) {
-    static size_t page_size = 0;
-    if (!page_size) page_size = (size_t)sysconf(_SC_PAGESIZE);
-    return page_size;
+    return (size_t)sysconf(_SC_PAGESIZE);
 }
 
 // Round up to page size
@@ -170,8 +170,18 @@ static inline shmlib_t *shmlib_open(const char *channel) {
         return NULL;
     }
 
+    if (st.st_size < 0 || (uintmax_t)st.st_size > SIZE_MAX) {
+        close(fd);
+        errno = EOVERFLOW;
+        return NULL;
+    }
     file_size = (size_t)st.st_size;
     hdr_size = shmlib__page_align(sizeof(shmlib_header_t));
+    if (file_size < hdr_size) {
+        close(fd);
+        errno = EAGAIN;
+        return NULL;
+    }
 
     mem = mmap(NULL, file_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     if (mem == MAP_FAILED) {
@@ -195,21 +205,20 @@ static inline shmlib_t *shmlib_open(const char *channel) {
         return NULL;
     }
 
-    SHMLIB_FENCE_ACQUIRE();
+    if (hdr->ro.capacity == 0 ||
+        hdr->ro.capacity > (file_size - hdr_size) / NUM_BUFFERS ||
+        hdr->ro.capacity % shmlib__get_page_size() != 0) {
+        munmap(mem, file_size);
+        close(fd);
+        errno = EINVAL;
+        return NULL;
+    }
+    buf_size = (size_t)hdr->ro.capacity;
 
     q = (shmlib_t *)malloc(sizeof(shmlib_t));
     if (!q) {
         munmap(mem, file_size);
         close(fd);
-        return NULL;
-    }
-
-    buf_size = (size_t)hdr->ro.capacity;
-    if (buf_size == 0) {
-        free(q);
-        munmap(mem, file_size);
-        close(fd);
-        errno = EINVAL;
         return NULL;
     }
 
@@ -222,7 +231,7 @@ static inline shmlib_t *shmlib_open(const char *channel) {
     q->held_read_idx = SHMLIB_NO_BUFFER;
     q->write_seq = 0;
     {
-        uint64_t cur_seq = SHMLIB_ATOMIC_LOAD_U64(&hdr->prod.publish_seq, SHMLIB_MO_ACQUIRE);
+        uint64_t cur_seq = SHMLIB_ATOMIC_LOAD_U64(&hdr->prod.publish_seq, SHMLIB_MO_SEQ_CST);
         q->next_write_seq = cur_seq + 1;
         /* Seed last_read_seq so that messages written before this open()
          * are invisible to the consumer.  Without this, stale shared memory
@@ -239,10 +248,11 @@ static inline shmlib_t *shmlib_open(const char *channel) {
 // Safe against concurrent creators. (channel is bare name, e.g. "video")
 static inline shmlib_t *shmlib_init(const char *channel, size_t capacity) {
     char name[SHMLIB_NAME_MAX];
+    unsigned attempt;
 
     if (shmlib__build_name(channel, name, sizeof(name)) < 0) return NULL;
 
-    for (;;) {
+    for (attempt = 0; attempt < 1000; attempt++) {
         shmlib_t *q;
         size_t page;
         size_t hdr_size;
@@ -254,18 +264,16 @@ static inline shmlib_t *shmlib_init(const char *channel, size_t capacity) {
         uint8_t *base;
 
         q = shmlib_open(channel);
-        if (q) return q;  
+        if (q) {
+            if (q->hdr->ro.capacity >= capacity) return q;
+            munmap(q->hdr, q->map_size);
+            close(q->fd);
+            free(q);
+            errno = EMSGSIZE;
+            return NULL;
+        }
         if (errno == EAGAIN) {
             shmlib__sleep_us(1000ULL);
-            continue;
-        }
-
-        if (errno == EINVAL) {
-            // Latest-only policy: remove stale/incompatible segment and recreate.
-            if (shm_unlink(name) < 0 && errno != ENOENT) {
-                fprintf(stderr, "Error removing incompatible shared memory '%s': %s\n", name, strerror(errno));
-                return NULL;
-            }
             continue;
         }
 
@@ -278,8 +286,20 @@ static inline shmlib_t *shmlib_init(const char *channel, size_t capacity) {
         if (capacity < page) capacity = page;
 
         hdr_size = shmlib__page_align(sizeof(shmlib_header_t));
+        if (capacity > SIZE_MAX - (page - 1)) {
+            errno = EOVERFLOW;
+            return NULL;
+        }
         buf_size = shmlib__page_align(capacity);
+        if (buf_size > (SIZE_MAX - hdr_size) / NUM_BUFFERS) {
+            errno = EOVERFLOW;
+            return NULL;
+        }
         file_size = hdr_size + (buf_size * NUM_BUFFERS);
+        if ((off_t)file_size < 0 || (uintmax_t)(off_t)file_size != file_size) {
+            errno = EOVERFLOW;
+            return NULL;
+        }
 
         fd = shm_open(name, O_CREAT | O_RDWR | O_EXCL, 0666);
         if (fd < 0) {
@@ -306,7 +326,7 @@ static inline shmlib_t *shmlib_init(const char *channel, size_t capacity) {
         }
 
         hdr = (shmlib_header_t *)mem;
-        memset(hdr, 0, sizeof(*hdr));
+        // Newly created POSIX shared memory is already zero-filled.
         hdr->ro.magic = SHMLIB_MAGIC;
         hdr->ro.capacity = buf_size;
         SHMLIB_ATOMIC_STORE_U64(&hdr->prod.publish_seq, 0, SHMLIB_MO_RELAXED);
@@ -316,9 +336,6 @@ static inline shmlib_t *shmlib_init(const char *channel, size_t capacity) {
         SHMLIB_ATOMIC_STORE_U32(&hdr->cons.slot_refcnt[0], 0, SHMLIB_MO_RELAXED);
         SHMLIB_ATOMIC_STORE_U32(&hdr->cons.slot_refcnt[1], 0, SHMLIB_MO_RELAXED);
         SHMLIB_ATOMIC_STORE_U32(&hdr->cons.slot_refcnt[2], 0, SHMLIB_MO_RELAXED);
-        SHMLIB_FENCE_RELEASE();
-        SHMLIB_ATOMIC_STORE_U32(&hdr->ro.version, 5u, SHMLIB_MO_RELEASE);
-
         q = (shmlib_t *)malloc(sizeof(shmlib_t));
         if (!q) {
             munmap(mem, file_size);
@@ -341,8 +358,11 @@ static inline shmlib_t *shmlib_init(const char *channel, size_t capacity) {
         q->fd = fd;
         q->map_size = file_size;
 
+        SHMLIB_ATOMIC_STORE_U32(&hdr->ro.version, 5u, SHMLIB_MO_RELEASE);
         return q;
     }
+    errno = EAGAIN;
+    return NULL;
 }
 
 // Cleanup
@@ -350,7 +370,7 @@ static inline void shmlib_close(shmlib_t *q) {
     if (!q) return;
 
     if (q->held_read_idx != SHMLIB_NO_BUFFER) {
-        SHMLIB_ATOMIC_FETCH_SUB_U32(&q->hdr->cons.slot_refcnt[q->held_read_idx], 1, SHMLIB_MO_ACQ_REL);
+        SHMLIB_ATOMIC_FETCH_SUB_U32(&q->hdr->cons.slot_refcnt[q->held_read_idx], 1, SHMLIB_MO_SEQ_CST);
         q->held_read_idx = SHMLIB_NO_BUFFER;
     }
 
@@ -389,7 +409,7 @@ static inline void *shmlib_write_begin(shmlib_t *q) {
         return NULL;
     }
 
-    published_seq = SHMLIB_ATOMIC_LOAD_U64(&q->hdr->prod.publish_seq, SHMLIB_MO_ACQUIRE);
+    published_seq = SHMLIB_ATOMIC_LOAD_U64(&q->hdr->prod.publish_seq, SHMLIB_MO_SEQ_CST);
     latest_idx = (published_seq == 0) ? SHMLIB_NO_BUFFER : (uint32_t)(published_seq % NUM_BUFFERS);
 
     for (offset = 0; offset < NUM_BUFFERS; offset++) {
@@ -399,7 +419,9 @@ static inline void *shmlib_write_begin(shmlib_t *q) {
 
         if (idx == latest_idx) continue;
 
-        refs = SHMLIB_ATOMIC_LOAD_U32(&q->hdr->cons.slot_refcnt[idx], SHMLIB_MO_ACQUIRE);
+        // Together with publication and reader pinning, SC prevents both
+        // sides from missing each other's updates and accessing a slot at once.
+        refs = SHMLIB_ATOMIC_LOAD_U32(&q->hdr->cons.slot_refcnt[idx], SHMLIB_MO_SEQ_CST);
         if (refs == 0) {
             q->write_idx = idx;
             q->write_seq = candidate_seq;
@@ -438,7 +460,7 @@ static inline int shmlib_write_end(shmlib_t *q, size_t len) {
     idx = q->write_idx;
 
     SHMLIB_ATOMIC_STORE_U64(&q->hdr->prod.sizes[idx], len, SHMLIB_MO_RELAXED);
-    SHMLIB_ATOMIC_STORE_U64(&q->hdr->prod.publish_seq, q->write_seq, SHMLIB_MO_RELEASE);
+    SHMLIB_ATOMIC_STORE_U64(&q->hdr->prod.publish_seq, q->write_seq, SHMLIB_MO_SEQ_CST);
     q->next_write_seq = q->write_seq + 1;
     q->write_idx = SHMLIB_NO_BUFFER;
     q->write_seq = 0;
@@ -473,20 +495,25 @@ static inline void *shmlib_read_begin(shmlib_t *q, size_t *len) {
         return NULL;
     }
 
-    seq = SHMLIB_ATOMIC_LOAD_U64(&q->hdr->prod.publish_seq, SHMLIB_MO_ACQUIRE);
+    seq = SHMLIB_ATOMIC_LOAD_U64(&q->hdr->prod.publish_seq, SHMLIB_MO_SEQ_CST);
     if (seq == 0 || seq == q->last_read_seq) return NULL;
 
     idx = (uint32_t)(seq % NUM_BUFFERS);
 
-    SHMLIB_ATOMIC_FETCH_ADD_U32(&q->hdr->cons.slot_refcnt[idx], 1, SHMLIB_MO_ACQ_REL);
+    SHMLIB_ATOMIC_FETCH_ADD_U32(&q->hdr->cons.slot_refcnt[idx], 1, SHMLIB_MO_SEQ_CST);
 
-    seq_check = SHMLIB_ATOMIC_LOAD_U64(&q->hdr->prod.publish_seq, SHMLIB_MO_ACQUIRE);
+    seq_check = SHMLIB_ATOMIC_LOAD_U64(&q->hdr->prod.publish_seq, SHMLIB_MO_SEQ_CST);
     if (seq_check != seq) {
-        SHMLIB_ATOMIC_FETCH_SUB_U32(&q->hdr->cons.slot_refcnt[idx], 1, SHMLIB_MO_ACQ_REL);
+        SHMLIB_ATOMIC_FETCH_SUB_U32(&q->hdr->cons.slot_refcnt[idx], 1, SHMLIB_MO_SEQ_CST);
         return NULL;
     }
 
     size = SHMLIB_ATOMIC_LOAD_U64(&q->hdr->prod.sizes[idx], SHMLIB_MO_RELAXED);
+    if (size > shmlib_capacity(q)) {
+        SHMLIB_ATOMIC_FETCH_SUB_U32(&q->hdr->cons.slot_refcnt[idx], 1, SHMLIB_MO_SEQ_CST);
+        errno = EMSGSIZE;
+        return NULL;
+    }
     *len = (size_t)size;
     q->last_read_seq = seq;
     q->held_read_idx = idx;
@@ -497,7 +524,7 @@ static inline void *shmlib_read_begin(shmlib_t *q, size_t *len) {
 static inline void shmlib_read_end(shmlib_t *q) {
     if (!q || q->held_read_idx == SHMLIB_NO_BUFFER) return;
 
-    SHMLIB_ATOMIC_FETCH_SUB_U32(&q->hdr->cons.slot_refcnt[q->held_read_idx], 1, SHMLIB_MO_ACQ_REL);
+    SHMLIB_ATOMIC_FETCH_SUB_U32(&q->hdr->cons.slot_refcnt[q->held_read_idx], 1, SHMLIB_MO_SEQ_CST);
     q->held_read_idx = SHMLIB_NO_BUFFER;
 }
 

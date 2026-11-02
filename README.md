@@ -106,6 +106,13 @@ gcc -O2 -Wall -I include examples/simple_pointcloud_consumer.c -lrt             
 gcc -O2 -Wall -I include examples/pointcloud_consumer.c        -lrt -lpthread    -o /tmp/pointcloud_consumer
 ```
 
+Run the regression tests (using isolated files in `/tmp` for shared mappings):
+
+```bash
+gcc -std=gnu11 -O2 -Wall -Wextra -I include tests/test_shmlib.c -pthread -lrt -o /tmp/shmlib-test
+/tmp/shmlib-test
+```
+
 ## How it works
 
 The shared region is laid out as:
@@ -124,7 +131,9 @@ The shared region is laid out as:
 +--------------------------+
 ```
 
-Each publish increments `publish_seq` (monotonic) and chooses slot `seq % 3`. Readers atomically increment `slot_refcnt[seq % 3]` to *pin* the latest slot, then re-check `publish_seq` to confirm the producer didn't race past — if so they release the pin and try again. The producer's `write_begin` searches for a slot that is neither the latest nor pinned, so consumers can never starve the producer with only 3 slots in play.
+Each publish advances `publish_seq` (monotonic) and chooses slot `seq % 3`. Readers atomically increment `slot_refcnt[seq % 3]` to *pin* the latest slot, then re-check `publish_seq` to confirm the producer didn't race past — if so they release the pin and can retry. Publication and reference-count operations use sequentially consistent ordering so the producer and reader cannot both miss each other's updates. The producer's `write_begin` searches for a slot that is neither the latest nor pinned, returning `EAGAIN` if none is available.
+
+A consumer that exits without releasing a pin can permanently reserve a slot; two abandoned slots can stop publishing. Recovery requires stopping all users of the channel, unlinking it, and recreating it. Rebuild both producers and consumers to use the corrected atomic ordering; the shared-memory layout is unchanged.
 
 A fresh `shmlib_open` seeds its `last_read_seq` to the producer's current `publish_seq`, so consumers don't see stale messages from a previous producer session.
 
@@ -148,6 +157,8 @@ void  shmlib_read_end  (shmlib_t *q);                // mandatory after a succes
 `channel` is a bare name (e.g. `"demo"`); the on-disk object is `/dev/shm/shmlib_<channel>`.
 
 A handle has at most one outstanding `write_begin` *or* `read_begin` at a time — a second call without the matching `_end` returns `EBUSY`.
+
+`shmlib_init` rejects an existing channel smaller than the requested capacity with `EMSGSIZE`, and rejects incompatible or malformed layouts with `EINVAL`. It never automatically unlinks an existing channel. Incomplete initialization is retried up to 1000 times with 1 ms sleeps, then returns `EAGAIN`; callers may retry. Unrepresentable creation sizes return `EOVERFLOW`. `shmlib_open` returns `EAGAIN` immediately for incomplete initialization. Always keep writes within `shmlib_capacity(q)`; `write_end` cannot undo an out-of-bounds write.
 
 ## Messages
 
